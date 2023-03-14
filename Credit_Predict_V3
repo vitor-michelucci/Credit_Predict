@@ -1,0 +1,591 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Created on Mon Mar 13 17:31:22 2023
+
+@author: vitormichelucci
+"""
+#%% Carregando os pacotes
+
+import warnings
+warnings.filterwarnings('ignore')
+import numpy as np
+import pandas as pd   
+import matplotlib.pyplot as plt
+import seaborn as sns
+from imblearn.over_sampling import SMOTE
+import itertools
+
+import statsmodels.api as sm
+from statstests.process import stepwise
+from statsmodels.iolib.summary2 import summary_col
+from sklearn.metrics import roc_curve, auc
+
+#%% Carregamento dos dados
+
+data = pd.read_csv("application_record.csv", encoding = 'utf-8') 
+record = pd.read_csv("credit_record.csv", encoding = 'utf-8')  
+
+# Comando auxiliar para ajuste da cor de fundo das plotagens
+plt.rcParams['figure.facecolor'] = 'white'
+
+#%% Preparando a variável target
+
+# Foram selecionados os usuários que estão atrasados há mais de 60 dias como 
+# usuários de risco-alvo. Essas amostras serão classificadas como '1', enquanto 
+# as outras serão classificadas como '0'.
+
+# find all users' account open month.
+begin_month=pd.DataFrame(record.groupby(["ID"])["MONTHS_BALANCE"].agg(min))
+begin_month=begin_month.rename(columns={'MONTHS_BALANCE':'begin_month'}) 
+new_data=pd.merge(data,begin_month,how="left",on="ID") #merge to record data
+
+record['dep_value'] = None
+record['dep_value'][record['STATUS'] =='2']='Yes' 
+record['dep_value'][record['STATUS'] =='3']='Yes' 
+record['dep_value'][record['STATUS'] =='4']='Yes' 
+record['dep_value'][record['STATUS'] =='5']='Yes' 
+
+cpunt=record.groupby('ID').count()
+cpunt['dep_value'][cpunt['dep_value'] > 0]='Yes' 
+cpunt['dep_value'][cpunt['dep_value'] == 0]='No' 
+cpunt = cpunt[['dep_value']]
+new_data=pd.merge(new_data,cpunt,how='inner',on='ID')
+new_data['target']=new_data['dep_value']
+new_data.loc[new_data['target']=='Yes','target']=1
+new_data.loc[new_data['target']=='No','target']=0
+
+print(cpunt['dep_value'].value_counts())
+cpunt['dep_value'].value_counts(normalize=True)
+
+#%% Preparando as Features
+
+# Renomeando as variáveis
+
+new_data.rename(columns={'CODE_GENDER':'Gender','FLAG_OWN_CAR':'Car','FLAG_OWN_REALTY':'Reality',
+                         'CNT_CHILDREN':'ChldNo','AMT_INCOME_TOTAL':'inc',
+                         'NAME_EDUCATION_TYPE':'edutp','NAME_FAMILY_STATUS':'famtp',
+                        'NAME_HOUSING_TYPE':'houtp','FLAG_EMAIL':'email',
+                         'NAME_INCOME_TYPE':'inctp','FLAG_WORK_PHONE':'wkphone',
+                         'FLAG_PHONE':'phone','CNT_FAM_MEMBERS':'famsize',
+                        'OCCUPATION_TYPE':'occyp'
+                        },inplace=True)
+
+new_data.dropna()
+new_data = new_data.mask(new_data == 'NULL').dropna()
+
+ivtable=pd.DataFrame(new_data.columns,columns=['variable'])
+ivtable['IV']=None
+namelist = ['FLAG_MOBIL','begin_month','dep_value','target','ID']
+
+for i in namelist:
+    ivtable.drop(ivtable[ivtable['variable'] == i].index, inplace=True)
+    
+# Tratando as variáveis binárias
+    
+# Calculate information value
+def calc_iv(df, feature, target, pr=False):
+    lst = []
+    df[feature] = df[feature].fillna("NULL")
+
+    for i in range(df[feature].nunique()):
+        val = list(df[feature].unique())[i]
+        lst.append([feature,                                                        # Variable
+                    val,                                                            # Value
+                    df[df[feature] == val].count()[feature],                        # All
+                    df[(df[feature] == val) & (df[target] == 0)].count()[feature],  # Good (think: Fraud == 0)
+                    df[(df[feature] == val) & (df[target] == 1)].count()[feature]]) # Bad (think: Fraud == 1)
+
+    data = pd.DataFrame(lst, columns=['Variable', 'Value', 'All', 'Good', 'Bad'])
+    data['Share'] = data['All'] / data['All'].sum()
+    data['Bad Rate'] = data['Bad'] / data['All']
+    data['Distribution Good'] = (data['All'] - data['Bad']) / (data['All'].sum() - data['Bad'].sum())
+    data['Distribution Bad'] = data['Bad'] / data['Bad'].sum()
+    data['WoE'] = np.log(data['Distribution Good'] / data['Distribution Bad'])
+    
+    data = data.replace({'WoE': {np.inf: 0, -np.inf: 0}})
+
+    data['IV'] = data['WoE'] * (data['Distribution Good'] - data['Distribution Bad'])
+
+    data = data.sort_values(by=['Variable', 'Value'], ascending=[True, True])
+    data.index = range(len(data.index))
+
+    if pr:
+        print(data)
+        print('IV = ', data['IV'].sum())
+
+    iv = data['IV'].sum()
+    print('This variable\'s IV is:',iv)
+    print(df[feature].value_counts())
+    return iv, data
+
+def convert_dummy(df, feature,rank=0):
+    pos = pd.get_dummies(df[feature], prefix=feature)
+    mode = df[feature].value_counts().index[rank]
+    biggest = feature + '_' + str(mode)
+    pos.drop([biggest],axis=1,inplace=True)
+    df.drop([feature],axis=1,inplace=True)
+    df=df.join(pos)
+    return df
+
+def get_category(df, col, binsnum, labels, qcut = False):
+    if qcut:
+        localdf = pd.qcut(df[col], q = binsnum, labels = labels) # quantile cut
+    else:
+        localdf = pd.cut(df[col], bins = binsnum, labels = labels) # equal-length cut
+        
+    localdf = pd.DataFrame(localdf)
+    name = 'gp' + '_' + col
+    localdf[name] = localdf[col]
+    df = df.join(localdf[name])
+    df[name] = df[name].astype(object)
+    return df
+
+def plot_confusion_matrix(cm, classes,
+                          normalize=False,
+                          title='Confusion matrix',
+                          cmap=plt.cm.Blues):
+    if normalize:
+        cm = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]
+        
+    print(cm)
+
+    plt.imshow(cm, interpolation='nearest', cmap=cmap)
+    plt.title(title)
+    plt.colorbar()
+    tick_marks = np.arange(len(classes))
+    plt.xticks(tick_marks, classes)
+    plt.yticks(tick_marks, classes)
+
+    fmt = '.2f' if normalize else 'd'
+    thresh = cm.max() / 2.
+    for i, j in itertools.product(range(cm.shape[0]), range(cm.shape[1])):
+        plt.text(j, i, format(cm[i, j], fmt),
+                 horizontalalignment="center",
+                 color="white" if cm[i, j] > thresh else "black")
+
+    plt.tight_layout()
+    plt.ylabel('True label')
+    plt.xlabel('Predicted label')
+
+# Gender
+    
+new_data['Gender'] = new_data['Gender'].replace(['F','M'],[0,1])
+print(new_data['Gender'].value_counts())
+iv, data = calc_iv(new_data,'Gender','target')
+ivtable.loc[ivtable['variable']=='Gender','IV']=iv
+data.head()
+
+# Car
+
+new_data['Car'] = new_data['Car'].replace(['N','Y'],[0,1])
+print(new_data['Car'].value_counts())
+iv, data=calc_iv(new_data,'Car','target')
+ivtable.loc[ivtable['variable']=='Car','IV']=iv
+data.head()
+
+# House
+
+new_data['Reality'] = new_data['Reality'].replace(['N','Y'],[0,1])
+print(new_data['Reality'].value_counts())
+iv, data=calc_iv(new_data,'Reality','target')
+ivtable.loc[ivtable['variable']=='Reality','IV']=iv
+data.head()
+
+# Phone
+
+new_data['phone']=new_data['phone'].astype(str)
+print(new_data['phone'].value_counts(normalize=True,sort=False))
+new_data.drop(new_data[new_data['phone'] == 'nan' ].index, inplace=True)
+iv, data=calc_iv(new_data,'phone','target')
+ivtable.loc[ivtable['variable']=='phone','IV']=iv
+data.head()
+
+# Email
+
+print(new_data['email'].value_counts(normalize=True,sort=False))
+new_data['email']=new_data['email'].astype(str)
+iv, data=calc_iv(new_data,'email','target')
+ivtable.loc[ivtable['variable']=='email','IV']=iv
+data.head()
+
+# Work Phone
+
+new_data['wkphone']=new_data['wkphone'].astype(str)
+iv, data = calc_iv(new_data,'wkphone','target')
+new_data.drop(new_data[new_data['wkphone'] == 'nan' ].index, inplace=True)
+ivtable.loc[ivtable['variable']=='wkphone','IV']=iv
+data.head()
+
+# Tratando as variáveis contínuas
+## Categorizando em faixas e transformando em dummies
+
+# Children Numbers
+
+new_data.loc[new_data['ChldNo'] >= 2,'ChldNo']='2More'
+print(new_data['ChldNo'].value_counts(sort=False))
+
+iv, data=calc_iv(new_data,'ChldNo','target')
+ivtable.loc[ivtable['variable']=='ChldNo','IV']=iv
+data.head()
+
+new_data = convert_dummy(new_data,'ChldNo')
+
+# Annual Income
+
+new_data['inc']=new_data['inc'].astype(object)
+new_data['inc'] = new_data['inc']/10000 
+print(new_data['inc'].value_counts(bins=10,sort=False))
+new_data['inc'].plot(kind='hist',bins=50,density=True)
+
+
+new_data = get_category(new_data,'inc', 3, ["low","medium", "high"], qcut = True)
+iv, data = calc_iv(new_data,'gp_inc','target')
+ivtable.loc[ivtable['variable']=='inc','IV']=iv
+data.head()
+
+###############################################################################
+
+# Verificar!!!
+
+def get_category(df, col, binsnum, labels, qcut=True):
+    if qcut and pd.api.types.is_numeric_dtype(df[col]): # verifique se a coluna é numérica
+        localdf = pd.qcut(df[col], q = binsnum, labels = labels) # quantile cut
+    else:
+        localdf = pd.cut(df[col], binsnum, labels = labels) # intervalo igual cut
+    df[col+'_gp'] = localdf
+    return df
+
+new_data = get_category(new_data,'inc', 3, ["low","medium", "high"], qcut = True)
+iv, data = calc_iv(new_data,'inc_gp','target')
+ivtable.loc[ivtable['variable']=='inc','IV']=iv
+data.head()
+
+###############################################################################
+
+new_data['inc_gp'].value_counts()
+
+new_data = convert_dummy(new_data,'inc_gp')
+
+# Age
+
+new_data['Age']=-(new_data['DAYS_BIRTH'])//365	
+print(new_data['Age'].value_counts(bins=10,normalize=True,sort=False))
+new_data['Age'].plot(kind='hist',bins=20,density=True)
+
+new_data = get_category(new_data,'Age',5, ["lowest","low","medium","high","highest"])
+iv, data = calc_iv(new_data,'Age_gp','target')
+ivtable.loc[ivtable['variable']=='DAYS_BIRTH','IV'] = iv
+data.head()
+
+new_data = convert_dummy(new_data,'Age_gp')
+
+# Working Years
+
+new_data['worktm']=-(new_data['DAYS_EMPLOYED'])//365	
+new_data[new_data['worktm']<0] = np.nan # replace by na
+new_data['DAYS_EMPLOYED']
+new_data['worktm'].fillna(new_data['worktm'].mean(),inplace=True) #replace na by mean
+new_data['worktm'].plot(kind='hist',bins=20,density=True)
+
+new_data = get_category(new_data,'worktm',5, ["lowest","low","medium","high","highest"])
+iv, data=calc_iv(new_data,'worktm_gp','target')
+ivtable.loc[ivtable['variable']=='DAYS_EMPLOYED','IV']=iv
+data.head()
+
+new_data = convert_dummy(new_data,'worktm_gp')
+
+# Family Size
+
+new_data['famsize'].value_counts(sort=False)
+
+new_data['famsize']=new_data['famsize'].astype(int)
+new_data['famsizegp']=new_data['famsize']
+new_data['famsizegp']=new_data['famsizegp'].astype(object)
+new_data.loc[new_data['famsizegp']>=3,'famsizegp']='3more'
+iv, data=calc_iv(new_data,'famsizegp','target')
+ivtable.loc[ivtable['variable']=='famsize','IV']=iv
+data.head()
+
+new_data = convert_dummy(new_data,'famsizegp')
+
+#%% Tratando as variáveis categóricas
+
+# Income type
+
+print(new_data['inctp'].value_counts(sort=False))
+print(new_data['inctp'].value_counts(normalize=True,sort=False))
+new_data.loc[new_data['inctp']=='Pensioner','inctp']='State servant'
+new_data.loc[new_data['inctp']=='Student','inctp']='State servant'
+iv, data=calc_iv(new_data,'inctp','target')
+ivtable.loc[ivtable['variable']=='inctp','IV']=iv
+data.head()
+
+new_data = convert_dummy(new_data,'inctp')
+
+# Ocuppation Type
+
+new_data.loc[(new_data['occyp']=='Cleaning staff') | (new_data['occyp']=='Cooking staff') | (new_data['occyp']=='Drivers') | (new_data['occyp']=='Laborers') | (new_data['occyp']=='Low-skill Laborers') | (new_data['occyp']=='Security staff') | (new_data['occyp']=='Waiters/barmen staff'),'occyp']='Laborwk'
+new_data.loc[(new_data['occyp']=='Accountants') | (new_data['occyp']=='Core staff') | (new_data['occyp']=='HR staff') | (new_data['occyp']=='Medicine staff') | (new_data['occyp']=='Private service staff') | (new_data['occyp']=='Realty agents') | (new_data['occyp']=='Sales staff') | (new_data['occyp']=='Secretaries'),'occyp']='officewk'
+new_data.loc[(new_data['occyp']=='Managers') | (new_data['occyp']=='High skill tech staff') | (new_data['occyp']=='IT staff'),'occyp']='hightecwk'
+print(new_data['occyp'].value_counts())
+iv, data=calc_iv(new_data,'occyp','target')
+ivtable.loc[ivtable['variable']=='occyp','IV']=iv
+data.head()         
+
+new_data = convert_dummy(new_data,'occyp')
+
+# House Type
+
+iv, data=calc_iv(new_data,'houtp','target')
+ivtable.loc[ivtable['variable']=='houtp','IV']=iv
+data.head()
+
+new_data = convert_dummy(new_data,'houtp')
+
+# Education
+
+new_data.loc[new_data['edutp']=='Academic degree','edutp']='Higher education'
+iv, data=calc_iv(new_data,'edutp','target')
+ivtable.loc[ivtable['variable']=='edutp','IV']=iv
+data.head()
+
+new_data = convert_dummy(new_data,'edutp')
+
+# Marriage Condition
+
+new_data['famtp'].value_counts(normalize=True,sort=False)
+
+iv, data=calc_iv(new_data,'famtp','target')
+ivtable.loc[ivtable['variable']=='famtp','IV']=iv
+data.head()
+
+new_data = convert_dummy(new_data,'famtp')
+
+# IV, WOE
+
+ivtable=ivtable.sort_values(by='IV',ascending=False)
+ivtable.loc[ivtable['variable']=='DAYS_BIRTH','variable']='agegp'
+ivtable.loc[ivtable['variable']=='DAYS_EMPLOYED','variable']='worktmgp'
+ivtable.loc[ivtable['variable']=='inc','variable']='incgp'
+ivtable
+
+# Tirando os espaços dos nomes das variáveis
+
+new_data.columns = new_data.columns.str.replace(' ', '_')
+new_data.columns = new_data.columns.str.replace('_/_', '_')
+new_data.columns = new_data.columns.str.replace('-', '_')
+new_data.columns = new_data.columns.str.replace('/', '_')
+
+# Ajustando a variável target
+
+new_data['target'] = new_data['target'].astype(int)
+
+# Visualizando o dataset transformado
+
+new_data.info()
+
+#%% Salvando a base de dados 
+
+new_data.to_csv('df.creditIII.csv',index=False)
+
+#%%
+
+###############################################################################
+#             Modelagem dos dados com regressão logística                     #
+###############################################################################
+
+#%% Carregando o dataset
+
+new_data = pd.read_csv("df.creditIII.csv", encoding = "utf-8")
+
+new_data.info()
+
+# Ajustando dataset
+
+df_modelo = new_data[['ID','target','Gender','Reality','ChldNo_1',
+                      'ChldNo_2More','wkphone','Age_gp_high','Age_gp_highest',
+                      'Age_gp_low','Age_gp_medium','worktm_gp_high','worktm_gp_highest',
+                      'worktm_gp_low','worktm_gp_medium','occyp_hightecwk', 
+                      'occyp_officewk','famsizegp_1','famsizegp_3more',
+                      'houtp_Co_op_apartment','houtp_Municipal_apartment',
+                      'houtp_Office_apartment','houtp_Rented_apartment',
+                      'houtp_With_parents','edutp_Higher_education',
+                      'edutp_Incomplete_higher','edutp_Lower_secondary',
+                      'famtp_Civil_marriage','famtp_Separated',
+                      'famtp_Single_not_married','famtp_Widow']]
+
+#%% Estimação do modelo logístico binário
+
+# Definição da fórmula utilizada no modelo
+lista_colunas = list(df_modelo.drop(columns=['ID',
+                                              'target']).columns)
+formula_dummies_modelo = ' + '.join(lista_colunas)
+formula_dummies_modelo = "target ~ " + formula_dummies_modelo
+print("Fórmula utilizada: ",formula_dummies_modelo)
+
+#Modelo propriamente dito
+modelo_credito = sm.Logit.from_formula(formula_dummies_modelo, 
+                                       new_data).fit()
+
+#Parâmetros do modelo
+modelo_credito.summary()
+
+
+#%% Procedimento Stepwise
+
+#Estimação do modelo por meio do procedimento Stepwise
+step_modelo_credito = stepwise(modelo_credito, pvalue_limit=0.05)
+
+# In[ ]: Comparando os parâmetros dos modelos
+
+summary_col([modelo_credito, step_modelo_credito],
+            model_names=["MODELO INICIAL","MODELO STEPWISE"],
+            stars=True,
+            info_dict = {
+                'N':lambda x: "{0:d}".format(int(x.nobs)),
+                'Log-lik':lambda x: "{:.2f}".format(x.llf)
+        })
+
+
+# In[ ]: Construção de função para a definição da matriz de confusão
+
+from sklearn.metrics import confusion_matrix, accuracy_score,\
+    ConfusionMatrixDisplay, recall_score
+
+def matriz_confusao(predicts, observado, cutoff):
+    
+    values = predicts.values
+    
+    predicao_binaria = []
+        
+    for item in values:
+        if item < cutoff:
+            predicao_binaria.append(0)
+        else:
+            predicao_binaria.append(1)
+           
+    cm = confusion_matrix(predicao_binaria, observado)
+    disp = ConfusionMatrixDisplay(confusion_matrix=cm)
+    disp.plot()
+    plt.xlabel('True')
+    plt.ylabel('Classified')
+    plt.gca().invert_xaxis()
+    plt.gca().invert_yaxis()
+    plt.show()
+        
+    sensitividade = recall_score(observado, predicao_binaria, pos_label=1)
+    especificidade = recall_score(observado, predicao_binaria, pos_label=0)
+    acuracia = accuracy_score(observado, predicao_binaria)
+
+    #Visualizando os principais indicadores desta matriz de confusão
+    indicadores = pd.DataFrame({'Sensitividade':[sensitividade],
+                                'Especificidade':[especificidade],
+                                'Acurácia':[acuracia]})
+    return indicadores
+
+
+# In[ ]: Construção da matriz de confusão
+
+# Adicionando os valores previstos de probabilidade na base de dados
+df_modelo['phat'] = step_modelo_credito.predict()
+
+#Matriz de confusão para cutoff = 0.5
+matriz_confusao(observado=df_modelo['target'],
+                predicts=df_modelo['phat'],
+                cutoff=0.50)
+
+# In[ ]: Construção da curva ROC
+
+#Função 'roc_curve' do pacote 'metrics' do sklearn
+
+fpr, tpr, thresholds = roc_curve(df_modelo['target'], df_modelo['phat'])
+roc_auc = auc(fpr, tpr)
+
+# Cálculo do coeficiente de GINI
+gini = (roc_auc - 0.5) / (0.5)
+
+# Plotando a curva ROC
+plt.figure(figsize=(10, 10))
+plt.plot(fpr, tpr, '-o', color='red')
+plt.plot(fpr, fpr, ':', color='gray')
+plt.title('Área abaixo da curva: %g' % round(roc_auc, 4) +
+          ' | Coeficiente de GINI: %g' % round(gini, 4), fontsize=17)
+plt.xlabel('1 - Especificidade', fontsize=15)
+plt.ylabel('Sensitividade', fontsize=15)
+plt.show()
+
+
+# In[ ]: Igualando critérios de especificidade e de sensitividade
+
+#Tentaremos estabelecer um critério que iguale a probabilidade de
+#acerto daqueles que chegarão atrasados (sensitividade) e a probabilidade de
+#acerto daqueles que não chegarão atrasados (especificidade).
+
+#ATENÇÃO: o que será feito a seguir possui fins didáticos, apenas. DE NENHUMA
+#FORMA o procedimento garante a maximização da acurácia do modelo!
+
+#Criação da função 'espec_sens' para a construção de um dataset com diferentes
+#valores de cutoff, sensitividade e especificidade:
+
+def espec_sens(observado,predicts):
+    
+    # adicionar objeto com os valores dos predicts
+    values = predicts.values
+    
+    # range dos cutoffs a serem analisados em steps de 0.01
+    cutoffs = np.arange(0,1.01,0.01)
+    
+    # Listas que receberão os resultados de especificidade e sensitividade
+    lista_sensitividade = []
+    lista_especificidade = []
+    
+    for cutoff in cutoffs:
+        
+        predicao_binaria = []
+        
+        # Definindo resultado binário de acordo com o predict
+        for item in values:
+            if item >= cutoff:
+                predicao_binaria.append(1)
+            else:
+                predicao_binaria.append(0)
+                
+        # Cálculo da sensitividade e especificidade no cutoff
+        sensitividade = recall_score(observado, predicao_binaria, pos_label=1)
+        especificidadee = recall_score(observado, predicao_binaria, pos_label=0)
+        
+        # Adicionar valores nas listas
+        lista_sensitividade.append(sensitividade)
+        lista_especificidade.append(especificidadee)
+        
+    # Criar dataframe com os resultados nos seus respectivos cutoffs
+    resultado = pd.DataFrame({'cutoffs':cutoffs,'sensitividade':lista_sensitividade,'especificidade':lista_especificidade})
+    return resultado
+
+
+# In[ ]: Até o momento, foram extraídos 3 vetores: 'sensitividade',
+#'especificidade' e 'cutoffs'. Assim, criamos um dataframe que contém
+#os vetores mencionados
+
+dados_plotagem = espec_sens(observado = df_modelo['target'],
+                            predicts = df_modelo['phat'])
+dados_plotagem
+
+
+# In[ ]: Visualizando o novo dataframe 'dados_plotagem' e plotando os dados
+#em um gráfico que mostra a variação da especificidade e da sensitividade
+#em função do cutoff
+
+plt.figure(figsize=(10,10))
+plt.plot(dados_plotagem.cutoffs,dados_plotagem.sensitividade, '-o',
+         color='indigo')
+plt.plot(dados_plotagem.cutoffs,dados_plotagem.especificidade, '-o',
+         color='limegreen')
+plt.legend(['Sensitividade', 'Especificidade'], fontsize=17)
+plt.xlabel('Cuttoff', fontsize=14)
+plt.ylabel('Sensitividade / Especificidade', fontsize=14)
+plt.show()
+
+#%%
+############################   FIM  ###########################################

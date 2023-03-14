@@ -1,0 +1,301 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Created on Sun Mar 12 13:06:25 2023
+
+@author: vitormichelucci
+"""
+
+#%% Libraries
+
+import pandas as pd # manipulação de dado em formato de dataframe
+import seaborn as sns # biblioteca de visualização de informações estatísticas
+import matplotlib.pyplot as plt # biblioteca de visualização de dados
+import statsmodels.api as sm # biblioteca de modelagem estatística
+import numpy as np # biblioteca para operações matemáticas multidimensionais
+from scipy import stats # estatística chi2
+from statsmodels.iolib.summary2 import summary_col # comparação entre modelos
+import plotly.graph_objs as go # gráfico 3D
+import statsmodels.formula.api as smf # estimação do modelo logístico binário
+from statstests.process import stepwise
+
+import warnings
+warnings.filterwarnings('ignore')
+
+
+#%%  Carregando os dados
+
+dfx = pd.read_csv("application_record.csv", encoding = "utf-8")
+dfy = pd.read_csv("credit_record.csv", encoding = "utf-8")
+
+#%% Visualizando os dataset
+
+dfx.head()
+dfx.info()
+
+dfy.head()
+dfy.info()
+
+#%% Verificando valores faltantes
+
+dfx.isna().sum()
+
+dfy.isna().sum()
+
+#%% Verificando valores duplicados
+
+dfx.duplicated().sum()
+
+dfy.duplicated().sum()
+
+#%% Verificando a cardinalidade
+
+dfx.nunique()
+
+dfy.nunique()
+
+#%% Tratamento os valores faltantes
+
+dfx['OCCUPATION_TYPE'].fillna(value='Other', inplace=True)
+
+dfx.isna().sum()
+
+#%% Construindo a variável target
+
+dfy['target']=dfy['STATUS']
+dfy['target'].replace('X', 0, inplace=True)
+dfy['target'].replace('C', 0, inplace=True)
+dfy['target']=dfy['target'].astype(int)
+dfy.loc[dfy['target']>=1,'target']=1
+
+# target=1 (alto risco) atraso igual ou superior a 30 dias em pelo menos um mês.
+target_df=pd.DataFrame(dfy.groupby(['ID'])['target'].agg(max)).reset_index()
+
+# Juntando os datasets pelo ID
+df_xy=pd.merge(dfx, target_df, how='inner', on=['ID'])
+
+#%% Criando uma variável que representa quantidade de meses em que houve atraso
+
+start_df=pd.DataFrame(dfy.groupby(['ID'])['MONTHS_BALANCE'].
+                      agg(min)).reset_index()
+
+# Renomeando a coluna
+start_df.rename(columns={'MONTHS_BALANCE':'ACCOUNT_LENGTH'}, inplace=True)
+
+# Tornando os valores positivos
+start_df['ACCOUNT_LENGTH']=-start_df['ACCOUNT_LENGTH']
+
+# Juntando com dataset df_xy
+#df_xy=pd.merge(df_xy, start_df, how='inner', on=['ID'])
+
+#%% Ajustando as variáveis DAYS_BIRTH  e DAYS_EMPLOYED para contagem em anos
+
+# Criando a variável AGE_YEARS
+df_xy['AGE_YEARS']=-df_xy['DAYS_BIRTH']/365.2425
+df_xy.drop('DAYS_BIRTH', axis=1, inplace=True)
+
+# Criando um indicador de desemprego
+df_xy['UNEMPLOYED']=0
+df_xy.loc[-df_xy['DAYS_EMPLOYED']<0,'UNEMPLOYED']=1
+
+# Criando a variável YEARS_EMPLOYED
+df_xy['YEARS_EMPLOYED']=-df_xy['DAYS_EMPLOYED']/365.2425
+df_xy.loc[df_xy['YEARS_EMPLOYED']<0,'YEARS_EMPLOYED']=0
+df_xy.drop('DAYS_EMPLOYED', axis=1, inplace=True)
+
+#%% Ajustando variáveis categóricas
+
+# CODE_GENDER: F = 0 / M = 1
+
+df_xy["CODE_GENDER"] =  df_xy["CODE_GENDER"].replace(['F','M'],[0,1])
+df_xy["FLAG_OWN_CAR"] = df_xy["FLAG_OWN_CAR"].replace(["Y","N"],[1,0])
+df_xy["FLAG_OWN_REALTY"] = df_xy["FLAG_OWN_REALTY"].replace(["Y","N"],[1,0])
+
+
+#%% Renomeando variáveis
+
+df_xy = df_xy.rename(columns={'CODE_GENDER': 'Gender', 'FLAG_OWN_CAR': 'Own_car', 
+                               'FLAG_OWN_REALTY':'Own_property','CNT_CHILDREN':'Num_children',
+                               'AMT_INCOME_TOTAL':'Total_income','NAME_INCOME_TYPE':'Income_type',
+                               'NAME_EDUCATION_TYPE':'Education_type','NAME_FAMILY_STATUS':'Family_status',
+                               'NAME_HOUSING_TYPE':'Housing_type','FLAG_MOBIL':'Mobile','FLAG_WORK_PHONE':'Work_phone',
+                               'FLAG_PHONE':'Phone','FLAG_EMAIL':'Email','OCCUPATION_TYPE':'Occupation_type',
+                               'CNT_FAM_MEMBERS':'Num_family','target':'Target','AGE_YEARS':'Age',
+                               'UNEMPLOYED':'Unemployed','YEARS_EMPLOYED':'Years_employed'})
+
+#%% Ajustando o tipo das variáveis
+
+df_xy.info()
+
+df_xy['ID']=df_xy['ID'].astype(object)
+df_xy['Gender']=df_xy['Gender'].astype(object)
+df_xy['Own_property']=df_xy['Own_property'].astype(object)
+df_xy['Mobile']=df_xy['Mobile'].astype(object)
+df_xy['Work_phone']=df_xy['Work_phone'].astype(object)
+df_xy['Phone']=df_xy['Phone'].astype(object)
+df_xy['Email']=df_xy['Email'].astype(object)
+df_xy['Target']=df_xy['Target'].astype(object)
+df_xy['Unemployed']=df_xy['Unemployed'].astype(object)
+df_xy['Num_family']=df_xy['Num_family'].astype(int)
+df_xy['Own_car']=df_xy['Own_car'].astype(object)
+
+#%% Ordenando as colunas
+
+df_xy=df_xy[['ID', 'Gender', 'Own_car', 'Own_property', 'Mobile', 'Work_phone',
+               'Phone', 'Email', 'Unemployed', 'Num_children', 'Num_family', 
+               'Total_income', 'Age', 'Years_employed',  
+               'Income_type', 'Education_type', 'Family_status',
+               'Housing_type', 'Occupation_type','Target']]
+
+df_xy.info()
+df_xy.shape
+
+#%% Salvando a base de dados 
+
+df_xy.to_csv('df.credit.csv',index=False)
+
+#%% Modelagem dos dados com regressão logística
+
+#%% Carregando o dataset
+
+df = pd.read_csv("df.credit.csv", encoding = "utf-8")
+
+df.info()
+
+#%% Preparação do dataset
+
+# Fazendo a contagem da variável target
+
+df['Target'].value_counts()
+
+# Para fins desta análise, em função das características da funcão 'sm.Logit.from_formula'
+# sserá necessário converter a variável target para numérica (int)
+
+df['Target']=df['Target'].astype(int)
+df.dtypes
+
+# Transformação das variáveis categóricas não binárias em dummies
+
+# Verificando a quantidade de categorias das variáveis 
+df['Income_type'].value_counts()
+df['Education_type'].value_counts()
+df['Family_status'].value_counts()
+df['Housing_type'].value_counts()
+df['Occupation_type'].value_counts()
+
+# get dummies
+df_dummies = pd.get_dummies(df,
+                            columns=['Income_type',
+                                     'Education_type',
+                                     'Family_status',
+                                     'Housing_type',
+                                     'Occupation_type'],
+                                      drop_first=True)
+
+df_dummies.info()
+
+# Tirando os espaços dos nomes das variáveis
+
+df_dummies.columns = df_dummies.columns.str.replace(' ', '_')
+df_dummies.columns = df_dummies.columns.str.replace('_/_', '_')
+df_dummies.columns = df_dummies.columns.str.replace('-', '_')
+df_dummies.columns = df_dummies.columns.str.replace('/', '_')
+
+#%% Matriz de Correlação
+
+correlation_matrix = df.corr()
+fig = plt.figure(figsize=(12,9))
+sns.heatmap(correlation_matrix,annot=True,square=True, linewidths=.5,cmap=plt.cm.Reds)
+plt.show()
+
+###############################################################################
+#                          OBSERVAÇÃO
+###############################################################################
+# Provavelmente em razão de multicolinearidade entre as variáveis Num_children 
+# e Num_family, cujo índice de correlação é de 98%.
+# Sendo assim, a variável Num_children será excluída.
+
+df_dummies_ajust = df_dummies.drop('Num_children', axis=1)
+df_dummies_ajust.info()
+
+###############################################################################
+
+#%% Estimação do modelo logístico binário
+
+# Definição da fórmula utilizada no modelo
+lista_colunas = list(df_dummies_ajust.drop(columns=['ID',
+                                              'Target']).columns)
+formula_dummies_modelo = ' + '.join(lista_colunas)
+formula_dummies_modelo = "Target ~ " + formula_dummies_modelo
+print("Fórmula utilizada: ",formula_dummies_modelo)
+
+#Modelo propriamente dito
+modelo_credito = sm.Logit.from_formula(formula_dummies_modelo, 
+                                       df_dummies_ajust).fit()
+
+#Parâmetros do modelo
+modelo_credito.summary()
+
+#%% Procedimento Stepwise
+
+#Estimação do modelo por meio do procedimento Stepwise
+step_modelo_credito = stepwise(modelo_credito, pvalue_limit=0.05)
+
+# In[ ]: Comparando os parâmetros dos modelos
+
+summary_col([modelo_credito, step_modelo_credito],
+            model_names=["MODELO INICIAL","MODELO STEPWISE"],
+            stars=True,
+            info_dict = {
+                'N':lambda x: "{0:d}".format(int(x.nobs)),
+                'Log-lik':lambda x: "{:.2f}".format(x.llf)
+        })
+
+
+# In[ ]: Construção de função para a definição da matriz de confusão
+
+from sklearn.metrics import confusion_matrix, accuracy_score,\
+    ConfusionMatrixDisplay, recall_score
+
+def matriz_confusao(predicts, observado, cutoff):
+    
+    values = predicts.values
+    
+    predicao_binaria = []
+        
+    for item in values:
+        if item < cutoff:
+            predicao_binaria.append(0)
+        else:
+            predicao_binaria.append(1)
+           
+    cm = confusion_matrix(predicao_binaria, observado)
+    disp = ConfusionMatrixDisplay(confusion_matrix=cm)
+    disp.plot()
+    plt.xlabel('True')
+    plt.ylabel('Classified')
+    plt.gca().invert_xaxis()
+    plt.gca().invert_yaxis()
+    plt.show()
+        
+    sensitividade = recall_score(observado, predicao_binaria, pos_label=1)
+    especificidade = recall_score(observado, predicao_binaria, pos_label=0)
+    acuracia = accuracy_score(observado, predicao_binaria)
+
+    #Visualizando os principais indicadores desta matriz de confusão
+    indicadores = pd.DataFrame({'Sensitividade':[sensitividade],
+                                'Especificidade':[especificidade],
+                                'Acurácia':[acuracia]})
+    return indicadores
+
+
+# In[ ]: Construção da matriz de confusão
+
+# Adicionando os valores previstos de probabilidade na base de dados
+df_dummies_ajust['phat'] = step_modelo_credito.predict()
+
+#Matriz de confusão para cutoff = 0.5
+matriz_confusao(observado=df_dummies_ajust['Target'],
+                predicts=df_dummies_ajust['phat'],
+                cutoff=0.50)
+
